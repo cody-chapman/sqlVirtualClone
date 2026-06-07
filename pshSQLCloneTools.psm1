@@ -1,244 +1,260 @@
 <# 
     .SYNOPSIS 
-   Powershell Module that setups and helps orchestrate clones of SQL Server databases - by Cody Chapman
-    .VERSIONINFO 1.0.0
-       -12/12/2017 - initial Release
-
+    Powershell Module that setups and helps orchestrate clones of SQL Server databases without Hyper-V dependencies.
+    .VERSIONINFO 2.0.0
     .DESCRIPTION
-    The purpose of this module is to utilize Powershell to assist in te orchestration
-    of setting up cloned copies of databases that helps reduce the footprint and space utilized
-    in making these copies.
+    Utilizes native Windows Storage Engine and diskpart alongside SQL Server to orchestrate high-speed,
+    low-footprint database virtualization using VHDX differencing chains.
     
-    You should run this with administrative privileges.
-    
-  
-    - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
-    Obligatory Disclaimer
-    THE SCRIPT AND PARSER IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE 
-    INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY 
-    SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA 
-    OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION 
-    WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-    - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
-    
-    .LINK
-    Fetch pshSQLCloneTools from GitHub at:
-    https://github.com/cody-chapman/pshSQLCloneTools
-
+    Must be run within an Elevated (Administrator) PowerShell Session.
 #>
 
-Function Set-Database {
-    [cmdletbinding()]
+# ==========================================
+# INTERNAL UTILITIES & DATABASE HELPERS
+# ==========================================
+
+function Invoke-SqlVcDiskPart {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string]$ScriptContent)
+    
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    Set-Content -Path $tempFile -Value $ScriptContent -Encoding Ascii
+    $output = diskpart /s $tempFile
+    Remove-Item $tempFile -Force
+    return $output
+}
+
+function Backup-SqlVcDatabase {
+    param([string]$DatabaseName, [string]$BackupFile, [string]$BackupName)
+    Write-Verbose "Backing up database [$DatabaseName] to [$BackupFile]..."
+    $query = "BACKUP DATABASE [$DatabaseName] TO DISK = N'$BackupFile' WITH FORMAT, INIT, NAME = N'$BackupName', SKIP, NOREWIND, NOUNLOAD, STATS = 10;"
+    Invoke-Sqlcmd -Query $query -ServerInstance "." -QueryTimeout 3600
+}
+
+function Restore-SqlVcDatabase {
+    param([string]$BackupFile, [string]$NewLocation, [string]$NewDatabaseName)
+    Write-Verbose "Analyzing backup file layout for [$NewDatabaseName]..."
+    
+    # Dynamically extract logical and physical file components from backup
+    $files = Invoke-Sqlcmd -Query "RESTORE FILELISTONLY FROM DISK = N'$BackupFile';" -ServerInstance "."
+    
+    $moveClause = @()
+    foreach ($file in $files) {
+        $logicalName = $file.LogicalName
+        $physicalName = $file.PhysicalName
+        $ext = [System.IO.Path]::GetExtension($physicalName)
+        $fileName = [System.IO.Path]::GetFileNameWithoutExtension($physicalName)
+        
+        $newPhysicalPath = Join-Path $NewLocation "$NewDatabaseName`_$fileName$ext"
+        $moveClause += "MOVE '$logicalName' TO '$newPhysicalPath'"
+    }
+    $moveQueryParam = $moveClause -join ", "
+    
+    Write-Verbose "Restoring Base Image Database [$NewDatabaseName] onto virtual disk..."
+    $query = "RESTORE DATABASE [$NewDatabaseName] FROM DISK = N'$BackupFile' WITH $moveQueryParam, RECOVERY, REPLACE, STATS = 10;"
+    Invoke-Sqlcmd -Query $query -ServerInstance "." -QueryTimeout 3600
+}
+
+function Disconnect-SqlVcDatabase {
+    param([string]$DatabaseName)
+    Write-Verbose "Detaching database [$DatabaseName] from instance..."
+    $query = @"
+ALTER DATABASE [$DatabaseName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+EXEC sp_detach_db @dbname = N'$DatabaseName';
+"@
+    Invoke-Sqlcmd -Query $query -ServerInstance "." -ErrorAction SilentlyContinue
+}
+
+function Connect-SqlVcDatabase {
+    param([string]$DatabaseName, [string[]]$DatabaseFiles)
+    Write-Verbose "Attaching clone database [$DatabaseName]..."
+    
+    $fileFilesClause = @()
+    foreach ($file in $DatabaseFiles) {
+        $fileFilesClause += "(FILENAME = N'$file')"
+    }
+    $filesQueryParam = $fileFilesClause -join ", "
+    
+    $query = "CREATE DATABASE [$DatabaseName] ON $filesQueryParam FOR ATTACH;"
+    Invoke-Sqlcmd -Query $query -ServerInstance "."
+}
+
+function Remove-SqlVcDatabase {
+    param([string]$DatabaseName)
+    Write-Verbose "Dropping clone database [$DatabaseName]..."
+    $query = @"
+ALTER DATABASE [$DatabaseName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+DROP DATABASE [$DatabaseName];
+"@
+    Invoke-Sqlcmd -Query $query -ServerInstance "." -ErrorAction SilentlyContinue
+}
+
+# ==========================================
+# PUBLIC CORE FUNCTIONS
+# ==========================================
+
+function Set-SqlVcDatabaseState {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory=$true)]
         [string]$DatabaseName,
-        [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        [ValidateNotNullOrEmpty()]
+        [Parameter(Mandatory=$true)]
         [ValidateSet("Online", "Offline")]      
         [string]$DatabaseAction
     )    
     switch ($DatabaseAction) {
-
-        "Online" {
-            $SQLAction = "ONLINE"
-        }
-        "Offline" {
-            $SQLAction = "OFFLINE WITH ROLLBACK IMMEDIATE"
-        }
+        "Online"  { $SQLAction = "ONLINE" }
+        "Offline" { $SQLAction = "OFFLINE WITH ROLLBACK IMMEDIATE" }
     }
-    $SQLCMD = @"
     
-USE master;
-GO
-
-ALTER DATABASE [$DatabaseName] SET $SQLAction
-"@  
-    Invoke-Sqlcmd $SQLCMD -QueryTimeout 3600 -ServerInstance .
+    $SQLCMD = "USE master; ALTER DATABASE [$DatabaseName] SET $SQLAction;"  
+    Invoke-Sqlcmd -Query $SQLCMD -QueryTimeout 3600 -ServerInstance "."
     
-    $retval = Invoke-Sqlcmd -Query "select state_desc as IsOnline from sys.databases where name = '$DatabaseName';"
-    If ($retval.IsOnline -eq "ONLINE") {
-        Write-Verbose "[$DatabaseName] is ONLINE"
-    }
-    else {
-        Write-Verbose "[$DatabaseName] is OFFLINE"
+    $retval = Invoke-Sqlcmd -Query "SELECT state_desc as IsOnline FROM sys.databases WHERE name = '$DatabaseName';" -ServerInstance "."
+    if ($retval.IsOnline -eq "ONLINE") {
+        Write-Verbose "[$DatabaseName] state verified as ONLINE"
+    } else {
+        Write-Verbose "[$DatabaseName] state verified as OFFLINE"
     }
 }
 
-Function New-DatabaseImage {
-    [cmdletbinding()]
+function New-SqlVcImage {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory=$true)]
         [string]$DatabaseName,
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory=$true)]
         [string]$BaseDirectory,
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory=$true)]
         [string]$NewDatabaseName
     )
-    #setting internal parameters up from parameter input. 
-    $VHDFile = (Join-path $BaseDirectory ("\$NewDatabaseName\VHD\" + $NewDatabaseName + '.vhdx'))
-    $VHDMountPath = (Join-path $BaseDirectory ("\$NewDatabaseName\Mount\"))
-    $BackupDir = (Join-path $BaseDirectory ("\$NewDatabaseName\Backup\"))
-    $BackupFile = (Join-path $BaseDirectory ("\$NewDatabaseName\Backup\" + $NewDatabaseName + '.bak'))
+    
+    $VHDFile       = Join-Path $BaseDirectory "$NewDatabaseName\VHD\$NewDatabaseName.vhdx"
+    $VHDMountPath  = Join-Path $BaseDirectory "$NewDatabaseName\Mount\"
+    $BackupDir     = Join-Path $BaseDirectory "$NewDatabaseName\Backup\"
+    $BackupFile    = Join-Path $BaseDirectory "$NewDatabaseName\Backup\$NewDatabaseName.bak"
 
-    #Making directory structure for cloning
-    New-Item -ItemType directory -Path $VHDMountPath -ErrorAction SilentlyContinue | Out-Null
-    New-Item -ItemType directory -Path $BackupDir -ErrorAction SilentlyContinue | Out-Null
+    # Infrastructure Directory Mapping
+    $null = New-Item -ItemType Directory -Path $VHDMountPath -ErrorAction SilentlyContinue
+    $null = New-Item -ItemType Directory -Path $BackupDir -ErrorAction SilentlyContinue
 
+    # Disk Generation via native diskpart (2040 GB = 2088960 MB)
+    Write-Verbose "Generating Expandable Parent VHDX File..."
+    $diskpartScript = "create vdisk file=""$VHDFile"" maximum=2088960 type=expandable"
+    $null = Invoke-SqlVcDiskPart -ScriptContent $diskpartScript
 
-    #Creating VHD file for mounting
-    Write-Verbose "Command [New-VHD] is executing [$VHDFile]."
-    New-VHD -Dynamic -Path $VHDFile -SizeBytes 2040GB
+    # Attachment via native Windows Storage Engine
+    Write-Verbose "Mounting Parent VHDX..."
+    $null = Mount-DiskImage -ImagePath $VHDFile -StorageType VHDX
+    Start-Sleep -Seconds 2 # Allow Win32 storage sub-system registration
 
-    #Mounting VHD file to a predetermined location
-    Write-Verbose "Command [Mount-VHD] is executing [$VHDFile]."
-    Mount-VHD -Path $VHDFile
+    # Storage Architecture Preparation
+    $disk = Get-DiskImage -ImagePath $VHDFile | Get-Disk
+    $disk | Initialize-Disk -PartitionStyle MBR -ErrorAction SilentlyContinue | Out-Null
+    $partition = $disk | New-Partition -UseMaximumSize
+    $partition | Format-Volume -FileSystem NTFS -Confirm:$false | Out-Null
+    $partition | Add-PartitionAccessPath -AccessPath $VHDMountPath | Out-Null
 
-    #Initiaizing, partitioning, and formatting disk
-    Write-Verbose "Command [Initialize-Disk] is executing [$VHDFile]."
-    $Disk = Get-VHD -Path $VHDFile 
-    $Disk | Initialize-Disk -PartitionStyle MBR | Out-Null
-    Write-Verbose "Command [New-Partition] is executing [$VHDFile]."
-    $Disk | New-Partition -UseMaximumSize | Out-Null
-    $Partition = Get-Partition -DiskNumber $Disk.Number
-    Write-Verbose "Command [Format-Volume] is executing [$VHDFile]."
-    $Partition | Format-Volume -FileSystem NTFS -Confirm:$false | Out-Null
-    Write-Verbose "Command [Add-PartitionAccessPath] is executing [$VHDFile]."
-    $Partition | Add-PartitionAccessPath -AccessPath $VHDMountPath | Out-Null
+    # Virtual Deployment Execution Loop
+    Backup-SqlVcDatabase -BackupFile $BackupFile -DatabaseName $DatabaseName -BackupName $NewDatabaseName
+    Restore-SqlVcDatabase -BackupFile $BackupFile -NewLocation $VHDMountPath -NewDatabaseName $NewDatabaseName
 
-    #Backing up target database and restoring to newly mounted vhd disk image
-    Backup-Database -BackupFile $BackupFile -DatabaseName $DatabaseName -BackupName $NewDatabaseName
-    Restore-Database -BackupFile $BackupFile -NewLocation $VHDMountPath -NewDatabaseName $NewDatabaseName
+    # SQL Decoupling and Volume Teardown
+    Disconnect-SqlVcDatabase -DatabaseName $NewDatabaseName
+    
+    Write-Verbose "Dismounting Parent VHDX..."
+    $null = Dismount-DiskImage -ImagePath $VHDFile
 
-    #Cleanup of directories after clone process
-    Remove-Directory -Path $BackupDir
-    Remove-Directory -Path $VHDMountPath
-
-    #Detaching and dismounting database and then disk image
-    Detach-Database -DatabaseName $NewDatabaseName -ErrorAction SilentlyContinue
-    Write-Verbose "Command [Dismount-VHD] is executing [$VHDFile]."
-    Dismount-VHD -Path $VHDFile -ErrorAction SilentlyContinue
+    # Structural Cleanup
+    if (Test-Path $BackupDir) { Remove-Item $BackupDir -Force -Recurse -ErrorAction SilentlyContinue }
+    if (Test-Path $VHDMountPath) { Remove-Item $VHDMountPath -Force -Recurse -ErrorAction SilentlyContinue }
 }
-Function Remove-DatabaseImage {
-    [cmdletbinding()]
+
+function Remove-SqlVcImage {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory=$true)]
         [string]$BaseDirectory,
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory=$true)]
         [string]$NewDatabaseName
     )
-    #setting internal parameters up from parameter input. 
-    $VHDFile = (Join-path $BaseDirectory ("\$NewDatabaseName\VHD\" + $NewDatabaseName + '.vhdx'))
-    $CloneDir = (Join-path $BaseDirectory ("\$NewDatabaseName\"))
+    $VHDFile  = Join-Path $BaseDirectory "$NewDatabaseName\VHD\$NewDatabaseName.vhdx"
+    $CloneDir = Join-Path $BaseDirectory "$NewDatabaseName\"
 
-    #Detaching and dismounting database and then disk image
-    Detach-Database -DatabaseName $NewDatabaseName -ErrorAction SilentlyContinue
-    Write-Verbose "Command [Dismount-VHD] is executing [$VHDFile]."
-    Dismount-VHD -Path $VHDFile -ErrorAction SilentlyContinue
-
-    #Cleanup of directories after clone process
-    Remove-Directory -Path $CloneDir
+    Disconnect-SqlVcDatabase -DatabaseName $NewDatabaseName
+    $null = Dismount-DiskImage -ImagePath $VHDFile -ErrorAction SilentlyContinue
+    
+    if (Test-Path $CloneDir) { Remove-Item $CloneDir -Force -Recurse -ErrorAction SilentlyContinue }
 }
-Function Remove-DatabaseClone {
-    [cmdletbinding()]
+
+function New-SqlVcClone {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory=$true)]
         [string]$CloneDatabaseName,
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory=$true)]
         [string]$BaseDirectory,
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory=$true)]
         [string]$NewDatabaseName
     )
-    #setting internal parameters up from parameter input. 
-    $VHDFile = (Join-path $BaseDirectory ("\$NewDatabaseName\VHD\" + $CloneDatabaseName + '.vhdx'))
-    $CloneDir = (Join-path $BaseDirectory ("\$NewDatabaseName\" + $CloneDatabaseName))
+    $VHDFile            = Join-Path $BaseDirectory "$NewDatabaseName\VHD\$NewDatabaseName.vhdx"
+    $VHDCloneMountPath  = Join-Path $BaseDirectory "$NewDatabaseName\$CloneDatabaseName\Mount\"
+    $ChildVHDFile       = Join-Path $BaseDirectory "$NewDatabaseName\VHD\$CloneDatabaseName.vhdx"
 
-    #Detaching and dismounting database and then disk image
-    Detach-Database -DatabaseName $CloneDatabaseName -ErrorAction SilentlyContinue
-    Delete-Database -DatabaseName $CloneDatabaseName -ErrorAction SilentlyContinue
-    Write-Verbose "Command [Dismount-VHD] is executing [$VHDFile]."
-    Dismount-VHD -Path $VHDFile -ErrorAction SilentlyContinue
+    $null = New-Item -ItemType Directory -Path $VHDCloneMountPath -ErrorAction SilentlyContinue
 
-    #Cleanup of directories after clone process
-    Remove-Item -path $VHDFile -ErrorAction SilentlyContinue
-    Remove-Directory -path $CloneDir -ErrorAction SilentlyContinue
-}
-Function New-DatabaseClone {
-    [cmdletbinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$CloneDatabaseName,
-        [Parameter(Mandatory)]
-        [string]$BaseDirectory,
-        [Parameter(Mandatory)]
-        [string]$NewDatabaseName
-    )
-    $VHDFile = (Join-path $BaseDirectory ("\$NewDatabaseName\VHD\" + $NewDatabaseName + '.vhdx'))
-    $VHDCloneMountPath = (Join-path $BaseDirectory ("\$NewDatabaseName\$CloneDatabaseName\Mount\"))
-    $ChildVHDFile = (Join-path $BaseDirectory ("\$NewDatabaseName\VHD\" + $CloneDatabaseName + '.vhdx'))
+    # Generate Differencing Disk natively via diskpart (Points back to immutable parent VHDX)
+    Write-Verbose "Creating Differencing VHDX..."
+    $diskpartScript = "create vdisk file=""$ChildVHDFile"" parent=""$VHDFile"""
+    $null = Invoke-SqlVcDiskPart -ScriptContent $diskpartScript
 
-    Write-Verbose "Command [New-VHD] is executing [$ChildVHDFile] as Child Disk."
-    New-VHD -ParentPath $VHDFile -Path $ChildVHDFile -Differencing
-
-    Write-Verbose "Command [Mount-VHD] is executing [$ChildVHDFile]."
-    Mount-VHD -Path $ChildVHDFile
-
-    Write-Verbose "Command [Set-Disk] is executing [$ChildVHDFile]."
-    get-disk | set-disk -isOffline $false
+    # Mount Virtual Drive
+    Write-Verbose "Mounting Child VHDX..."
+    $null = Mount-DiskImage -ImagePath $ChildVHDFile -StorageType VHDX
     Start-Sleep -Seconds 2
-    $Disk = Get-VHD -Path $ChildVHDFile 
 
-    Write-Verbose "Command [Get-Partition] is executing [$ChildVHDFile]."
-    $Partition = Get-Partition -DiskNumber $Disk.Number
-    #Making directory structure for cloning
-    New-Item -ItemType directory -Path $VHDCloneMountPath -ErrorAction SilentlyContinue | Out-Null
-
-    Write-Verbose "Command [Remove-PartitionAccessPath] is executing [$ChildVHDFile]."
-    $drive1 = $Partition.DriveLetter + ":\"
-    Remove-PartitionAccessPath -AccessPath $drive1 -DiskNumber $Disk.DiskNumber -PartitionNumber $Partition.PartitionNumber -ErrorAction SilentlyContinue | Out-Null
-    Write-Verbose "Command [Add-PartitionAccessPath] is executing [$ChildVHDFile]."
-    $Partition | Add-PartitionAccessPath -AccessPath $VHDCloneMountPath | Out-null
-
-    $files = (Get-ChildItem -Path $VHDCloneMountPath -file | ForEach-Object { [PSCustomObject]@{Name = $_.Name } })  
-
-    $b = @()
-    foreach ($file in $files) {
-        [string]$a = $VHDCloneMountPath + $file.Name
-        $b += "$a"
+    $disk = Get-DiskImage -ImagePath $ChildVHDFile | Get-Disk
+    $disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue | Out-Null
+    
+    # Strip automatically assigned drive letters to preserve mount-path scheme
+    $partition = Get-Partition -DiskNumber $disk.DiskNumber
+    if ($partition.DriveLetter) {
+        Remove-PartitionAccessPath -AccessPath "$($partition.DriveLetter):\" -DiskNumber $disk.DiskNumber -PartitionNumber $partition.PartitionNumber -ErrorAction SilentlyContinue | Out-Null
     }
-    $DBFiles = $b
-    Attach-Database -DatabaseFiles $DBFiles -DatabaseName $CloneDatabaseName
+    $partition | Add-PartitionAccessPath -AccessPath $VHDCloneMountPath | Out-Null
 
+    # Dynamically locate DB payload components within the Virtual Drive Mount
+    $DBFiles = Get-ChildItem -Path $VHDCloneMountPath -File | Select-Object -ExpandProperty FullName
+
+    Connect-SqlVcDatabase -DatabaseFiles $DBFiles -DatabaseName $CloneDatabaseName
 }
-Function Remove-Directory {
+
+function Remove-SqlVcClone {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$Path
+        [Parameter(Mandatory=$true)]
+        [string]$CloneDatabaseName,
+        [Parameter(Mandatory=$true)]
+        [string]$BaseDirectory,
+        [Parameter(Mandatory=$true)]
+        [string]$NewDatabaseName
     )
+    $VHDFile  = Join-Path $BaseDirectory "$NewDatabaseName\VHD\$CloneDatabaseName.vhdx"
+    $CloneDir = Join-Path $BaseDirectory "$NewDatabaseName\$CloneDatabaseName"
 
-    #Cleanup of directories after clone process
-    Remove-Item $Path -Force -Recurse -ErrorAction SilentlyContinue
-}
-Function Install-pshSQLCloneTools {
-    #Code to Check Windows Version
-    #Code to Check Powershell version
-    #Code to test if Hyper-V Powershell tools can be installed
-    #Check to see if user is in the local hyper-v administrators group
-    Set-StorageSetting -NewDiskPolicy OnlineAll
-    #Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Management-PowerShell
-    #Install-WindowsFeature -Name Hyper-V-PowerShell
+    Remove-SqlVcDatabase -DatabaseName $CloneDatabaseName
+    $null = Dismount-DiskImage -ImagePath $VHDFile -ErrorAction SilentlyContinue
 
+    if (Test-Path $VHDFile) { Remove-Item -Path $VHDFile -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $CloneDir) { Remove-Item -Path $CloneDir -Force -Recurse -ErrorAction SilentlyContinue }
 }
-#Create-DatabaseImage -DatabaseName "HealthCheck" -NewDatabaseName "HealthCheck1" -BaseDirectory "C:\SQLClone\"
-#Delete-DatabaseImage -NewDatabaseName "HealthCheck1" -BaseDirectory "C:\SQLClone\"
-#Delete-DatabaseClone -NewDatabaseName "HealthCheck1" -CloneDatabaseName "HealthCheck_clone" -BaseDirectory "C:\SQLClone\"
-#Delete-DatabaseClone -NewDatabaseName "HealthCheck1" -CloneDatabaseName "HealthCheck_clone1" -BaseDirectory "C:\SQLClone\"
-#Delete-DatabaseClone -NewDatabaseName "HealthCheck1" -CloneDatabaseName "HealthCheck_clone2" -BaseDirectory "C:\SQLClone\"
-#Delete-DatabaseClone -NewDatabaseName "HealthCheck1" -CloneDatabaseName "HealthCheck_clone3" -BaseDirectory "C:\SQLClone\"
-#Refresh-DatabaseImage -DatabaseName "HealthCheck" -NewDatabaseName "HealthCheck1" -BaseDirectory "C:\SQLClone\"
-#Create-DatabaseClone -NewDatabaseName "HealthCheck1" -CloneDatabaseName "HealthCheck_clone" -BaseDirectory "C:\SQLClone\"
-#Create-DatabaseClone -NewDatabaseName "HealthCheck1" -CloneDatabaseName "HealthCheck_clone1" -BaseDirectory "C:\SQLClone\"
-#Create-DatabaseClone -NewDatabaseName "HealthCheck1" -CloneDatabaseName "HealthCheck_clone2" -BaseDirectory "C:\SQLClone\"
-#Create-DatabaseClone -NewDatabaseName "HealthCheck1" -CloneDatabaseName "HealthCheck_clone3" -BaseDirectory "C:\SQLClone\"
-#Set this once script is complete.
-Export-ModuleMember -Function '*'
+
+function Initialize-SqlVcEnvironment {
+    [CmdletBinding()]
+    param()
+    # Forces global Windows OS subsystem to auto-online newly bound storage footprints
+    Set-StorageSetting -NewDiskPolicy OnlineAll -ErrorAction SilentlyContinue
+    Write-Verbose "Storage System Policy set to OnlineAll."
+}
+
+Export-ModuleMember -Function 'Set-SqlVcDatabaseState', 'New-SqlVcImage', 'Remove-SqlVcImage', 'New-SqlVcClone', 'Remove-SqlVcClone', 'Initialize-SqlVcEnvironment'
